@@ -4,17 +4,15 @@ require("dotenv").config();
 
 const connectMongoDB = require("./database");
 
-async function startServer() {
-    try {
-        await connectMongoDB();
-        console.log("MongoDB connected successfully.");
-        const { start } = require("./app");
-        await start();
-    } catch (error) {
-        console.error("SERVER STARTUP FAILED");
-        console.error(error);
-        process.exit(1);
-    }
-}
-
-startServer();
+connectMongoDB()
+    .then(() => {
+        require("./app");
+    })
+    .catch(error => {
+        if (error.message === "MONGODB_URI must be configured before server startup.") {
+            console.error(error.message);
+        } else {
+            console.error("MongoDB connection failed; server was not started.", error.name);
+        }
+        process.exitCode = 1;
+    });
