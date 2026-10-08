@@ -1027,130 +1027,70 @@ app.post("/api/recharge/watchpays/callback", (req, res) => {
     if (!watchPaysEnabled) {
         return res.status(503).type("text").send("WatchPays is not configured.");
     }
-
     const merchantOrderNo = typeof req.body.merchantOrder === "string"
         ? req.body.merchantOrder.trim()
         : "";
-
     const gatewayOrderNo = typeof req.body.orderNo === "string"
         ? req.body.orderNo.trim().slice(0, 120)
         : "";
-
     const reportedStatus = typeof req.body.status === "string"
-        ? req.body.status.trim().toLowerCase().slice(0, 40)
+        ? req.body.status.trim().slice(0, 40).toLowerCase()
         : "";
-
     const callbackAmountPaise = parseRupees(req.body.amount);
-
-    if (
-        !merchantOrderNo ||
-        merchantOrderNo.length > 100 ||
-        !gatewayOrderNo ||
-        !reportedStatus ||
-        callbackAmountPaise === null ||
-        callbackAmountPaise <= 0
-    ) {
+    if (!merchantOrderNo || merchantOrderNo.length > 100 || !gatewayOrderNo
+        || !reportedStatus || callbackAmountPaise === null || callbackAmountPaise <= 0) {
         return res.status(400).type("text").send("Invalid callback.");
     }
 
-    if (!merchantOrderNo.startsWith("watchpays-")) {
-        return res.status(400).type("text").send("Invalid WatchPays order.");
-    }
-
     const transaction = database.prepare(
-        `SELECT
-            id,
-            user_id AS userId,
-            amount_paise AS amountPaise,
-            status
+        `SELECT id, amount_paise AS amountPaise, status
          FROM wallet_transactions
-         WHERE type = 'recharge'
-           AND reference = ?`
+         WHERE type = 'recharge' AND reference = ?`
     ).get(merchantOrderNo);
-
-    if (!transaction) {
+    if (!transaction || !merchantOrderNo.startsWith("watchpays-")) {
         return res.status(404).type("text").send("Recharge order not found.");
     }
-
     if (transaction.amountPaise !== callbackAmountPaise) {
         return res.status(400).type("text").send("Recharge amount does not match.");
     }
 
-    if (reportedStatus !== "success") {
+    if (transaction.status === "pending") {
+        const note = reportedStatus === "success"
+            ? `WatchPays reports payment success (gateway order ${gatewayOrderNo}). Verify in WatchPays before admin approval.`
+            : `WatchPays reports status '${reportedStatus}' (gateway order ${gatewayOrderNo}). Admin review required.`;
         database.prepare(
-            `UPDATE wallet_transactions
-             SET note = ?
-             WHERE id = ?
-               AND status = 'pending'`
-        ).run(
-            `WatchPays reports status '${reportedStatus}' (gateway order ${gatewayOrderNo}).`,
-            transaction.id
-        );
-
-        return res.type("text").send("success");
+            "UPDATE wallet_transactions SET note = ? WHERE id = ? AND status = 'pending'"
+        ).run(note, transaction.id);
     }
 
-    const creditWallet = database.transaction(() => {
-        const updated = database.prepare(
-            `UPDATE wallet_transactions
-             SET status = 'approved',
-                 note = ?,
-                 reviewed_at = CURRENT_TIMESTAMP
-             WHERE id = ?
-               AND status = 'pending'`
-        ).run(
-            `WatchPays payment successful. Gateway order ${gatewayOrderNo}. Wallet credited automatically.`,
-            transaction.id
-        );
-
-        // Prevent duplicate wallet credit.
-        if (updated.changes !== 1) {
-            return false;
-        }
-
-        const walletUpdate = database.prepare(
-            `UPDATE users
-             SET balance_paise = balance_paise + ?,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?`
-        ).run(
-            transaction.amountPaise,
-            transaction.userId
-        );
-
-        if (walletUpdate.changes !== 1) {
-            throw new Error("User wallet could not be updated.");
-        }
-
-        return true;
-    });
-
-    try {
-        const credited = creditWallet();
-
-        if (credited) {
-            console.log(
-                `WatchPays recharge approved: transaction=${transaction.id}, ` +
-                `user=${transaction.userId}, amountPaise=${transaction.amountPaise}, ` +
-                `gatewayOrder=${gatewayOrderNo}`
-            );
-        } else {
-            console.log(
-                `WatchPays callback already processed: transaction=${transaction.id}`
-            );
-        }
-
-        return res.type("text").send("success");
-    } catch (error) {
-        console.error("WatchPays wallet credit failed:", error);
-
-        return res
-            .status(500)
-            .type("text")
-            .send("Wallet credit failed.");
-    }
+    res.type("text").send("success");
 });
 
+app.post("/api/recharge", requireCsrf, requireAuth, asyncRoute(async (req, res) => {
+    const amountPaise = parseRupees(req.body.amount);
+    const method = typeof req.body.method === "string" ? req.body.method.trim().slice(0, 40) : "";
+    const minimum = Number(database.prepare(
+        "SELECT value FROM site_settings WHERE key = 'minimum_recharge_rupees'"
+    ).get()?.value || 295);
+    if (!amountPaise || amountPaise < minimum * 100 || !method) {
+        return res.status(400).json({ success: false, message: "Enter a valid amount and payment channel." });
+    }
+
+    if (mockPaymentEnabled) {
+        const orderId = `local-mock-${randomBytes(16).toString("hex")}`;
+        const transaction = database.prepare(
+            `INSERT INTO wallet_transactions (user_id, type, amount_paise, status, reference, note)
+             VALUES (?, 'recharge', ?, 'pending', ?, 'Local test checkout; no real payment')`
+        ).run(req.session.user.id, amountPaise, orderId);
+        return res.status(201).json({
+            success: true,
+            gateway: "mock",
+            transactionId: transaction.lastInsertRowid,
+            orderId,
+            paymentUrl: `/mock-checkout.html?transactionId=${transaction.lastInsertRowid}`,
+            message: "Local test checkout created. No real payment will be made."
+        });
+    }
 
     if (razorpayEnabled) {
         const receipt = `recharge-${Date.now()}-${req.session.user.id}`;
